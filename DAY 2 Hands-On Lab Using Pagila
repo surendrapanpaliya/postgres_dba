@@ -1,0 +1,473 @@
+DAY 2 Hands-On Lab Using Pagila
+
+Mapped to Fidelity use cases and highlighting differences vs Oracle, SQL Server, and AWS RDS PostgreSQL.
+
+How to run this lab: Use two psql windows (Session A + Session B).
+pgAdmin can be used, but psql is faster for concurrency labs.
+
+
+Modules Covered
+	1.	Transactions & Isolation Levels
+	2.	Locks, Blocking & Deadlocks
+	3.	Vacuum & Autovacuum Internals
+	4.	Lab + Q&A: Dead tuples, VACUUM, size checks, autovacuum inspection
+
+Dataset: pagila (tables: customer, payment, rental)
+Time: ~3 hrs 45 mins lab + Q&A sections embedded
+
+⸻
+
+✅ Pre-Lab Setup (Run Once)
+
+Step 0.1: Connect to Pagila
+
+Open two terminals.
+
+Terminal / Session A
+
+psql -U postgres -h localhost -p 5433 -d pagila
+
+Terminal / Session B
+
+psql -U postgres -h localhost -p 5433 -d pagila
+
+Step 0.2: Confirm tables exist
+
+\dt
+
+Step 0.3: Create a dedicated lab table (safer than touching core tables)
+
+DROP TABLE IF EXISTS lab_orders;
+CREATE TABLE lab_orders (
+  order_id      BIGSERIAL PRIMARY KEY,
+  customer_id   INT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'NEW',
+  amount        NUMERIC(10,2) NOT NULL,
+  updated_at    TIMESTAMP NOT NULL DEFAULT now()
+);
+
+INSERT INTO lab_orders (customer_id, status, amount)
+SELECT (random()*599)::int + 1, 'NEW', (random()*1000)::numeric(10,2)
+FROM generate_series(1, 20000);
+
+ANALYZE lab_orders;
+
+Why this step?
+	•	We need a table with heavy UPDATE patterns (like Fidelity order lifecycle tables).
+
+⸻
+
+1️⃣ Transactions Deep Dive & Isolation Levels (Hands-On)
+
+Lab 1.1 — MVCC Snapshot: “Why Session A still sees old data”
+
+Objective
+
+Show consistent reads using snapshots.
+
+Step 1 (Session A)
+
+BEGIN;
+SHOW transaction_isolation;
+SELECT status, COUNT(*) FROM lab_orders GROUP BY status ORDER BY 1;
+
+Step 2 (Session B)
+
+BEGIN;
+UPDATE lab_orders
+SET status = 'PROCESSED', updated_at = now()
+WHERE status = 'NEW'
+  AND order_id <= 5000;
+COMMIT;
+
+
+
+Step 3 (Session A) — run again without commit
+
+SELECT status, COUNT(*) FROM lab_orders GROUP BY status ORDER BY 1;
+
+
+✅ Expected outcome
+	•	Session A still sees old counts (snapshot taken at BEGIN).
+
+
+
+Step 4 (Session A) — commit and re-check
+
+
+COMMIT;
+SELECT status, COUNT(*) FROM lab_orders GROUP BY status ORDER BY 1;
+
+✅ Now Session A sees new counts.
+
+Oracle / SQL Server Comparison
+	•	Oracle: Similar “consistent read” via UNDO
+	•	SQL Server: Needs snapshot isolation / version store behavior; otherwise reads can block
+	•	PostgreSQL: MVCC is built-in; snapshot rules drive visibility
+
+⸻
+
+Lab 1.2 — Read Committed vs Repeatable Read vs Serializable
+
+Objective
+
+See practical behavior differences.
+
+Step 1 (Session A): Read Committed (default)
+
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SELECT COUNT(*) FROM lab_orders WHERE status = 'NEW';
+
+Step 2 (Session B): Change data
+
+UPDATE lab_orders
+SET status = 'NEW'
+WHERE status = 'PROCESSED'
+  AND order_id BETWEEN 7000 AND 8000;
+COMMIT;
+
+Step 3 (Session A): Re-run within same transaction
+
+SELECT COUNT(*) FROM lab_orders WHERE status = 'NEW';
+COMMIT;
+
+✅ In READ COMMITTED, Session A can see changed result within same transaction (new snapshot per statement).
+
+⸻
+
+Step 4: Repeatable Read
+
+Session A
+
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT COUNT(*) FROM lab_orders WHERE status = 'NEW';
+
+Session B
+
+UPDATE lab_orders
+SET status = 'NEW'
+WHERE status = 'PROCESSED'
+  AND order_id BETWEEN 9000 AND 10000;
+COMMIT;
+
+Session A
+
+SELECT COUNT(*) FROM lab_orders WHERE status = 'NEW';
+COMMIT;
+
+✅ In REPEATABLE READ, Session A sees the same count (same snapshot for whole transaction).
+
+⸻
+
+Step 5: Serializable (Reconciliation-grade)
+
+Session A
+
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+UPDATE lab_orders SET amount = amount + 10
+WHERE order_id BETWEEN 11000 AND 12000;
+
+Session B
+
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+UPDATE lab_orders SET amount = amount + 20
+WHERE order_id BETWEEN 11500 AND 12500;
+COMMIT;
+
+Session A
+
+COMMIT;
+
+✅ One of the commits may fail with:
+ERROR: could not serialize access due to read/write dependencies
+
+Fidelity Mapping
+	•	Trading systems: READ COMMITTED (high throughput)
+	•	End-of-day reconciliation: SERIALIZABLE (correctness first; app must retry)
+
+⸻
+
+2️⃣ Locks, Blocking & Deadlocks (Hands-On)
+
+Lab 2.1 — Row Lock Blocking (Reporting blocks trade update)
+
+Objective
+
+Show how an open transaction blocks writers.
+
+Step 1 (Session A): Lock a row and keep transaction open
+
+BEGIN;
+SELECT * FROM lab_orders WHERE order_id = 1 FOR UPDATE;
+-- DO NOT COMMIT YET
+
+Step 2 (Session B): Try to update same row
+
+UPDATE lab_orders SET status='CANCELLED', updated_at=now()
+WHERE order_id = 1;
+
+✅ Session B will hang (blocked).
+
+Step 3: Diagnose blocking chain (Session A or new session)
+
+SELECT
+  a.pid AS blocked_pid,
+  a.query AS blocked_query,
+  b.pid AS blocker_pid,
+  b.query AS blocker_query
+FROM pg_stat_activity a
+JOIN pg_stat_activity b ON b.pid = ANY(pg_blocking_pids(a.pid))
+WHERE a.datname = 'pagila';
+
+Step 4: Release lock (Session A)
+
+COMMIT;
+
+✅ Session B continues.
+
+Oracle / SQL Server Comparison
+	•	Oracle: reads don’t block writes (MVCC), but row locks behave similarly
+	•	SQL Server: locks can cause heavy blocking unless snapshot isolation used
+	•	PostgreSQL: row-level locking is explicit; long TXNs are the enemy
+
+⸻
+
+Lab 2.2 — Table Lock (DDL vs DML)
+
+Step 1 (Session A)
+
+BEGIN;
+LOCK TABLE lab_orders IN ACCESS EXCLUSIVE MODE;
+-- keep open
+
+Step 2 (Session B)
+
+SELECT COUNT(*) FROM lab_orders;
+
+✅ Blocked (because ACCESS EXCLUSIVE blocks everything)
+
+Step 3 (Session A)
+
+COMMIT;
+
+
+⸻
+
+Lab 2.3 — Advisory Locks (Batch job coordination)
+
+Objective
+
+Show “application-level lock” used for reconciliation jobs.
+
+Step 1 (Session A): Acquire advisory lock
+
+SELECT pg_advisory_lock(98765);
+
+Step 2 (Session B): Try to acquire same lock
+
+SELECT pg_advisory_lock(98765);
+
+✅ Session B blocks until A releases it.
+
+Step 3 (Session A): Release lock
+
+SELECT pg_advisory_unlock(98765);
+
+Fidelity Mapping
+	•	Use advisory locks so only one reconciliation batch runs at a time
+
+⸻
+
+Lab 2.4 — Deadlock Simulation
+
+Step 1 (Session A)
+
+BEGIN;
+UPDATE lab_orders SET amount = amount + 1 WHERE order_id = 10;
+-- keep open
+
+Step 2 (Session B)
+
+BEGIN;
+UPDATE lab_orders SET amount = amount + 1 WHERE order_id = 20;
+-- keep open
+
+Step 3: Cross-lock
+
+Session A
+
+UPDATE lab_orders SET amount = amount + 1 WHERE order_id = 20;
+
+Session B
+
+UPDATE lab_orders SET amount = amount + 1 WHERE order_id = 10;
+
+✅ One session will error with deadlock detected:
+ERROR: deadlock detected
+
+DBA Note
+	•	PostgreSQL detects deadlocks and aborts one transaction automatically
+
+⸻
+
+3️⃣ Vacuum & Autovacuum Internals (Hands-On)
+
+Lab 3.1 — Generate Dead Tuples & Bloat (Heavy UPDATE scenario)
+
+Objective
+
+Create dead tuples the way real order tables do.
+
+-- Create dead tuples by updating many rows multiple times
+UPDATE lab_orders
+SET status = 'UPDATED', updated_at = now()
+WHERE order_id <= 15000;
+
+UPDATE lab_orders
+SET status = 'UPDATED2', updated_at = now()
+WHERE order_id <= 15000;
+
+✅ Now many old row versions exist (dead tuples).
+
+⸻
+
+Lab 3.2 — Observe table size before vacuum
+
+SELECT
+  pg_size_pretty(pg_total_relation_size('lab_orders')) AS total_size,
+  pg_size_pretty(pg_relation_size('lab_orders')) AS table_size,
+  pg_size_pretty(pg_indexes_size('lab_orders')) AS index_size;
+
+
+⸻
+
+Lab 3.3 — VACUUM vs VACUUM FULL
+
+Step 1: VACUUM (non-blocking, keeps space reusable)
+
+VACUUM (VERBOSE, ANALYZE) lab_orders;
+
+Re-check sizes:
+
+SELECT pg_size_pretty(pg_total_relation_size('lab_orders'));
+
+✅ Expected:
+	•	Size may not reduce much
+	•	But space becomes reusable internally
+
+⸻
+
+Step 2: VACUUM FULL (rewrites table, exclusive lock)
+
+VACUUM FULL lab_orders;
+ANALYZE lab_orders;
+
+Re-check size again:
+
+SELECT pg_size_pretty(pg_total_relation_size('lab_orders'));
+
+✅ Expected:
+	•	Table size drops
+	•	But it requires exclusive lock (production risk)
+
+Fidelity Mapping
+	•	RDS incidents often occur when:
+	•	autovacuum falls behind
+	•	bloat increases
+	•	IOPS spikes
+	•	VACUUM FULL is rarely used in production due to locks
+
+⸻
+
+Lab 3.4 — Inspect Autovacuum Behavior
+
+Check autovacuum settings
+
+SHOW autovacuum;
+SHOW autovacuum_vacuum_threshold;
+SHOW autovacuum_vacuum_scale_factor;
+SHOW autovacuum_analyze_threshold;
+SHOW autovacuum_analyze_scale_factor;
+
+Check last vacuum/analyze timestamps
+
+SELECT
+  relname,
+  last_vacuum,
+  last_autovacuum,
+  last_analyze,
+  last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relname = 'lab_orders';
+
+
+⸻
+
+Lab 3.5 — Visibility & Free Space (Conceptual checks)
+
+You can show tuple stats:
+
+SELECT
+  relname,
+  n_live_tup,
+  n_dead_tup
+FROM pg_stat_user_tables
+WHERE relname = 'lab_orders';
+
+✅ Key learning:
+	•	Dead tuples accumulate fast
+	•	Vacuum is mandatory in PostgreSQL MVCC
+
+⸻
+
+Lab 3.6 — XID Wraparound Awareness (Conceptual)
+
+Show freeze age risk:
+
+SELECT
+  datname,
+  age(datfrozenxid) AS xid_age
+FROM pg_database
+ORDER BY xid_age DESC;
+
+DBA Note
+	•	Long-running transactions prevent freezing
+	•	Wraparound causes emergency vacuum (major outage risk)
+
+⸻
+
+4️⃣ Lab + Q&A (45 minutes) — Guided Fidelity Discussion Prompts
+
+Q&A Prompts (use after each lab)
+	1.	Which isolation level fits trading vs reconciliation and why?
+	2.	What causes “reporting blocks updates” in PostgreSQL?
+	3.	How do advisory locks compare to Oracle DBMS_LOCK / SQL Server sp_getapplock?
+	4.	Why can RDS have vacuum incidents even though it is managed?
+	5.	When would you use VACUUM FULL (if ever)?
+
+⸻
+
+⭐ Key Differences Summary (Oracle / SQL Server / RDS)
+
+PostgreSQL vs Oracle
+	•	Oracle consistent read uses UNDO
+	•	PostgreSQL consistent read uses tuple versions
+	•	Vacuum/autovacuum is essential in PostgreSQL, not in Oracle
+
+PostgreSQL vs SQL Server
+	•	SQL Server locking can be heavy unless snapshot isolation used
+	•	PostgreSQL reads don’t block writes, but long transactions are dangerous
+
+Local PostgreSQL vs RDS PostgreSQL
+	•	SQL is same
+	•	RDS removes OS access
+	•	Monitoring relies on:
+	•	pg_stat_activity
+	•	pg_stat_user_tables
+	•	CloudWatch metrics
+	•	Vacuum and query tuning remain DBA responsibility
+
